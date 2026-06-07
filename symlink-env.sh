@@ -1,0 +1,1 @@
+sudo ln -s /home/dwarakesh/Desktop/Dwarakesh/sys64/projects/headless-gpt/headless-gpt /usr/local/bin/headless-gpt
