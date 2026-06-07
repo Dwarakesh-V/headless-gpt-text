@@ -1,4 +1,4 @@
-#!/usr/local/bin/.venv/bin/python3
+#!/home/dwarakesh/Desktop/Dwarakesh/sys64/projects/headless-gpt/.venv/bin/python3
 
 import asyncio
 import base64
