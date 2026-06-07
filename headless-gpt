@@ -671,7 +671,7 @@ async def rcv_web_int(
 
 
 async def main() -> None:
-    MODEL = "gemini"
+    MODEL = "chatgpt"
     payload = read_clipboard()
 
     if payload.kind == ClipboardKind.EMPTY:
