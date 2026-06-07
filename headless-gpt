@@ -1,4 +1,4 @@
-#!/home/dwarakesh/Desktop/Dwarakesh/sys64/projects/headless-gpt/.venv/bin/python3
+#!/home/dwarakesh/envv/bin/python3
 
 import asyncio
 import base64
@@ -15,7 +15,6 @@ import pyperclip
 from playwright.async_api import async_playwright, Page
 
 os.environ["NODE_NO_WARNINGS"] = "1"
-
 
 DEBUG_PORT = "http://localhost:9222"
 
