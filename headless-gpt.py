@@ -1,25 +1,81 @@
 #!/usr/local/bin/.venv/bin/python3
 
-# This script is mapped to special keys for execution from anywhere
 import asyncio
+import base64
+import io
 import os
 import subprocess
+import tempfile
 import time
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional
 
-# Custom
 import pyperclip
 from playwright.async_api import async_playwright, Page
 
 os.environ["NODE_NO_WARNINGS"] = "1"
 
+
 DEBUG_PORT = "http://localhost:9222"
 
-STABLE_SECONDS: float = 2.5 # How long the response text must be unchanged before is is done
-POLL_INTERVAL: float = 0.8 # How often response element is polled
+STABLE_SECONDS: float = 2.5 # How long the response text must be unchanged before it is considered done
+POLL_INTERVAL: float = 0.8 # How often we poll the response element (seconds)
 MAX_WAIT_SECONDS: int = 300 # Maximum time to wait for generation to complete (seconds)
 MAX_RETRIES: int = 3 # How many times to retry the full send→receive flow on failure
 
-# Each entry is tried in order
+class ClipboardKind(Enum):
+    TEXT  = auto()
+    IMAGE = auto()
+    EMPTY = auto()
+
+@dataclass
+class ClipboardPayload:
+    kind:        ClipboardKind
+    text:        Optional[str]   = None   # set when kind == TEXT
+    image_bytes: Optional[bytes] = None   # set when kind == IMAGE
+    mime_type:   str             = "image/png"
+
+
+def read_clipboard() -> ClipboardPayload:
+    """
+    Read the system clipboard
+    """
+    try:
+        from PIL import ImageGrab, Image  # soft import — optional dependency
+
+        img = ImageGrab.grabclipboard()
+        if isinstance(img, Image.Image):
+            buf = io.BytesIO()
+            # Normalise to RGBA-RGB
+            if img.mode in ("RGBA", "LA"):
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(buf, format="PNG")
+            return ClipboardPayload(
+                kind=ClipboardKind.IMAGE,
+                image_bytes=buf.getvalue(),
+                mime_type="image/png",
+            )
+    except ImportError:
+        pass
+    except Exception as exc:
+        print(f"ImageGrab failed ({exc}), text clipboard will be used")
+
+    try:
+        text = pyperclip.paste()
+        if text and text.strip():
+            return ClipboardPayload(kind=ClipboardKind.TEXT, text=text)
+    except Exception as exc:
+        print(f"pyperclip.paste() failed: {exc}")
+
+    return ClipboardPayload(kind=ClipboardKind.EMPTY)
+
+# Each list is tried in order; first match wins.
+# Ordered: specific test-ids first - aria/role - broad fallbacks.
 EDITOR_SELECTORS: dict[str, list[str]] = {
     "claude": [
         '[data-testid="chat-input"]',
@@ -41,6 +97,44 @@ EDITOR_SELECTORS: dict[str, list[str]] = {
         'div[contenteditable="true"][aria-label*="message" i]',
         'div[role="textbox"][contenteditable="true"]',
         'div[contenteditable="true"]',
+    ],
+}
+
+# Selectors for hidden file inputs triggered by the attachment button.
+# All three UIs funnel uploads through a plain <input type="file">.
+FILE_INPUT_SELECTORS: dict[str, list[str]] = {
+    "claude": [
+        'input[type="file"][accept*="image"]',
+        'input[type="file"]',
+    ],
+    "chatgpt": [
+        'input[type="file"][accept*="image"]',
+        'input[type="file"]',
+    ],
+    "gemini": [
+        'input[type="file"][accept*="image"]',
+        'input[type="file"]',
+    ],
+}
+
+# Attachment / paperclip buttons — clicking these makes the file input appear in UIs that create it lazily (e.g. ChatGPT).
+ATTACH_BUTTON_SELECTORS: dict[str, list[str]] = {
+    "claude": [
+        'button[aria-label*="attach" i]',
+        'button[aria-label*="upload" i]',
+        'button[aria-label*="file" i]',
+        'label[for*="file" i]',
+    ],
+    "chatgpt": [
+        'button[aria-label*="attach" i]',
+        'button[aria-label*="upload" i]',
+        '[data-testid="attach-button"]',
+        'label[for*="file" i]',
+    ],
+    "gemini": [
+        'button[aria-label*="attach" i]',
+        'button[aria-label*="upload" i]',
+        'label[for*="file" i]',
     ],
 }
 
@@ -98,12 +192,16 @@ SEND_BUTTON_SELECTORS: dict[str, list[str]] = {
     ],
 }
 
+
 async def _first_matching_selector(
-    page: Page, selectors: list[str], timeout_ms: int = 3000, state: str = "visible"
-) -> tuple[str, object] | tuple[None, None]:
+    page: Page,
+    selectors: list[str],
+    timeout_ms: int = 3000,
+    state: str = "visible",
+):
     """
     Try each selector in order; return (selector_str, element) for the first hit.
-    Returns (None, None) if none match within timeout_ms each.
+    Returns (None, None) if none match.
     """
     for sel in selectors:
         try:
@@ -115,9 +213,9 @@ async def _first_matching_selector(
     return None, None
 
 
-async def _detect_editor_heuristic(page: Page) -> str | None:
+async def _detect_editor_heuristic(page: Page) -> Optional[str]:
     """
-    Score all contenteditable/textarea elements by position and size.
+    Score all contenteditable / textarea elements by position and size.
     Returns a unique CSS selector for the best candidate, or None.
     Last-resort fallback when all known selectors fail.
     """
@@ -132,10 +230,10 @@ async def _detect_editor_heuristic(page: Page) -> str | None:
             if (r.width === 0 || r.height === 0) return { el, score: -1 };
             let score = 0;
             if (r.bottom > window.innerHeight * 0.55) score += 4;
-            if (r.width > window.innerWidth * 0.35) score += 3;
-            if (r.height < 250) score += 2;
+            if (r.width  > window.innerWidth  * 0.35) score += 3;
+            if (r.height < 250)                        score += 2;
             if (el.getAttribute('aria-label') || el.getAttribute('placeholder')) score += 1;
-            if (el.closest('form')) score += 1;
+            if (el.closest('form'))                    score += 1;
             return { el, score };
         });
 
@@ -143,30 +241,30 @@ async def _detect_editor_heuristic(page: Page) -> str | None:
         const best = scored[0]?.el;
         if (!best || scored[0].score < 0) return null;
 
-        // Build a unique selector
         if (best.id) return '#' + CSS.escape(best.id);
-        // nth-of-type path
         const tag = best.tagName.toLowerCase();
-        const allOfTag = [...document.querySelectorAll(tag)];
-        const idx = allOfTag.indexOf(best) + 1;
+        const idx = [...document.querySelectorAll(tag)].indexOf(best) + 1;
         return `${tag}:nth-of-type(${idx})`;
     }""")
 
 
-async def _find_editor(page: Page, model: str) -> tuple[str, object]:
+async def _find_editor(page: Page, model: str):
     """
     Return (selector, element) for the chat input editor.
     Falls back to heuristic detection if known selectors fail.
     """
-    sel, el = await _first_matching_selector(page, EDITOR_SELECTORS[model], timeout_ms=4000)
+    sel, el = await _first_matching_selector(
+        page, EDITOR_SELECTORS[model], timeout_ms=4000
+    )
     if sel:
         return sel, el
 
-    # Heuristic fallback
     heuristic_sel = await _detect_editor_heuristic(page)
     if heuristic_sel:
         try:
-            el = await page.wait_for_selector(heuristic_sel, timeout=3000, state="visible")
+            el = await page.wait_for_selector(
+                heuristic_sel, timeout=3000, state="visible"
+            )
             if el:
                 print(f"[warn] Using heuristic editor selector: {heuristic_sel}")
                 return heuristic_sel, el
@@ -176,11 +274,10 @@ async def _find_editor(page: Page, model: str) -> tuple[str, object]:
     raise RuntimeError(f"Could not locate chat editor for model '{model}'")
 
 
-async def _inject_prompt(page: Page, selector: str, prompt: str) -> None:
+async def _inject_text(page: Page, selector: str, prompt: str) -> None:
     """
     Insert text into a contenteditable / textarea editor.
-    Uses execCommand (works in ProseMirror / Quill / plain textarea),
-    then verifies the content was set and falls back to DOM mutation if not.
+    execCommand first; DOM-mutation fallback if that leaves the field empty.
     """
     await page.evaluate(
         """({ selector, prompt }) => {
@@ -190,26 +287,21 @@ async def _inject_prompt(page: Page, selector: str, prompt: str) -> None:
 
             const isInput = el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
             if (isInput) {
-                // Native input/textarea value setter (bypasses React's synthetic events)
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                const nativeSetter = Object.getOwnPropertyDescriptor(
                     window.HTMLTextAreaElement.prototype, 'value'
                 )?.set;
-                if (nativeInputValueSetter) {
-                    nativeInputValueSetter.call(el, prompt);
-                } else {
-                    el.value = prompt;
-                }
-                el.dispatchEvent(new Event('input', { bubbles: true }));
+                if (nativeSetter) nativeSetter.call(el, prompt);
+                else              el.value = prompt;
+                el.dispatchEvent(new Event('input',  { bubbles: true }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
                 return;
             }
 
-            // ContentEditable path
+            // ContentEditable
             document.execCommand('selectAll', false, null);
-            document.execCommand('delete', false, null);
+            document.execCommand('delete',    false, null);
             const inserted = document.execCommand('insertText', false, prompt);
 
-            // DOM mutation fallback
             if (!inserted || !el.textContent.trim()) {
                 while (el.firstChild) el.removeChild(el.firstChild);
                 const p = document.createElement('p');
@@ -221,11 +313,182 @@ async def _inject_prompt(page: Page, selector: str, prompt: str) -> None:
         {"selector": selector, "prompt": prompt},
     )
 
+async def _try_file_input(page: Page, model: str, tmp_path: str) -> bool:
+    """
+    Method 1 (best): set_input_files() on a hidden <input type="file">.
+    Playwright talks directly to the browser via CDP — no focus required.
+    Returns True on success.
+    """
+    # Lazy input handling
+    _, attach_btn = await _first_matching_selector(
+        page, ATTACH_BUTTON_SELECTORS[model], timeout_ms=1500
+    )
+    if attach_btn:
+        try:
+            # Use dispatch_event so we don't need the page in focus
+            await attach_btn.dispatch_event("click")
+            await page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+    # Try every known file-input selector
+    for sel in FILE_INPUT_SELECTORS[model]:
+        try:
+            # Unhide the input so Playwright can interact with it
+            await page.evaluate(f"""() => {{
+                const el = document.querySelector('{sel}');
+                if (el) {{
+                    el.style.display    = 'block';
+                    el.style.visibility = 'visible';
+                    el.style.opacity    = '1';
+                    el.style.position   = 'fixed';
+                    el.style.top        = '0';
+                    el.style.left       = '0';
+                    el.style.zIndex     = '99999';
+                }}
+            }}""")
+            file_input = await page.query_selector(sel)
+            if file_input:
+                await file_input.set_input_files(tmp_path)
+                await page.wait_for_timeout(800)
+                print(f"Injected via file input ({sel})")
+                return True
+        except Exception as exc:
+            print(f"file_input attempt failed for '{sel}': {exc}")
+            continue
+
+    return False
+
+
+async def _try_cdp_drag(page: Page, model: str, tmp_path: str) -> bool:
+    """
+    Method 3 (demoted): CDP Input.dispatchDragEvent.
+    Requires browser launched with --enable-blink-features=DragInterception.
+    Will fast-fail with a clear message if that flag is missing.
+    """
+    try:
+        sel, el = await _find_editor(page, model)
+        box = await el.bounding_box()
+        if not box:
+            return False
+
+        cx = box["x"] + box["width"]  / 2
+        cy = box["y"] + box["height"] / 2
+
+        cdp = await page.context.new_cdp_session(page)
+
+        drag_data = {
+            "items": [{"mimeType": "Files", "data": ""}],
+            "files": [tmp_path],
+        }
+
+        await cdp.send("Input.dispatchDragEvent", {
+            "type": "dragEnter", "x": cx, "y": cy, "data": drag_data
+        })
+        await page.wait_for_timeout(100)
+        await cdp.send("Input.dispatchDragEvent", {
+            "type": "dragOver", "x": cx, "y": cy, "data": drag_data
+        })
+        await page.wait_for_timeout(100)
+        await cdp.send("Input.dispatchDragEvent", {
+            "type": "drop", "x": cx, "y": cy, "data": drag_data
+        })
+        await page.wait_for_timeout(600)
+        await cdp.detach()
+        print("Injected via CDP drag-and-drop")
+        return True
+
+    except Exception as exc:
+        if "Invalid parameters" in str(exc):
+            print(
+                "CDP drag unavailable. Relaunch chromium with "
+                "--enable-blink-features=DragInterception to enable it"
+            )
+        else:
+            print(f"CDP drag failed: {exc}")
+        return False
+    
+
+async def _try_clipboard_paste(
+    page: Page, model: str, image_bytes: bytes, mime_type: str
+) -> bool:
+    """
+    Method 2: bring tab to front (works with Xvfb virtual display),
+    write image to browser clipboard via JS, then send Ctrl+V.
+    Requires Chromium running under Xvfb — not bare --headless.
+    """
+    try:
+        await page.bring_to_front()
+        await page.wait_for_timeout(300)
+
+        await page.context.grant_permissions(
+            ["clipboard-read", "clipboard-write"], origin=page.url
+        )
+
+        b64 = base64.b64encode(image_bytes).decode()
+        await page.evaluate(
+            f"""async () => {{
+                const res  = await fetch('data:image/png;base64,{b64}');
+                const blob = await res.blob();
+                await navigator.clipboard.write([
+                    new ClipboardItem({{ 'image/png': blob }})
+                ]);
+            }}"""
+        )
+
+        sel, _ = await _find_editor(page, model)
+        await page.click(sel)
+        await page.wait_for_timeout(200)
+
+        await page.keyboard.press("Control+v")  # Linux always Ctrl, never Meta
+        await page.wait_for_timeout(600)
+        print("Injected via JS clipboard + paste")
+        return True
+
+    except Exception as exc:
+        print(f"Clipboard paste failed: {exc}")
+        return False
+
+
+async def _inject_image(
+    page: Page, model: str, image_bytes: bytes, mime_type: str = "image/png"
+) -> None:
+    """
+    Inject an image using a priority chain:
+        1. set_input_files on <input type="file">   - no focus, no flags (best)
+        2. bring_to_front() + JS clipboard + paste  - auto focus, no flags
+        3. CDP drag                                 - needs --enable-blink-features=DragInterception
+    """
+    suffix = ".png" if mime_type == "image/png" else ".jpg"
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    try:
+        os.write(tmp_fd, image_bytes)
+        os.close(tmp_fd)
+
+        if await _try_file_input(page, model, tmp_path):
+            return
+        print("[image] file_input failed - trying clipboard paste")
+
+        if await _try_clipboard_paste(page, model, image_bytes, mime_type):
+            return
+        print("[image] clipboard paste failed - trying CDP drag")
+
+        if await _try_cdp_drag(page, model, tmp_path):
+            return
+
+        raise RuntimeError(
+            "All three image injection methods failed. "
+            "Check that the AI tab supports image uploads and "
+            "that a file <input> or drag target is present."
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 async def _submit(page: Page, model: str) -> None:
-    """
-    Click the send button if found, otherwise press Enter.
-    """
+    """Click the send button if found, otherwise press Enter."""
     _, send_el = await _first_matching_selector(
         page, SEND_BUTTON_SELECTORS[model], timeout_ms=2000
     )
@@ -252,16 +515,14 @@ async def _get_latest_response(page: Page, model: str) -> str:
 
 async def _wait_for_response_stable(page: Page, model: str) -> str:
     """
-    Poll the response area until its text stops changing for STABLE_SECONDS.
-    Also watches the stop button: if it disappears, generation has ended.
-
-    This is far more robust than waiting on button disabled-states.
+    Poll the response area until its text stops changing for STABLE_SECONDS
+    AND the stop button has disappeared.
+    Far more robust than checking button disabled-states.
     """
-    # Brief pause so the UI can transition into the "generating" state
     await page.wait_for_timeout(1200)
 
-    last_text: str = ""
-    stable_since: float | None = None
+    last_text:    str            = ""
+    stable_since: Optional[float] = None
     deadline = time.monotonic() + MAX_WAIT_SECONDS
 
     while time.monotonic() < deadline:
@@ -269,32 +530,30 @@ async def _wait_for_response_stable(page: Page, model: str) -> str:
         current_text = await _get_latest_response(page, model)
 
         if current_text and current_text == last_text:
-            # Text hasn't changed — start (or continue) the stability timer
             if stable_since is None:
                 stable_since = time.monotonic()
             elif time.monotonic() - stable_since >= STABLE_SECONDS:
-                # Double-check: confirm the stop button is gone (generation done)
                 stop_sel, _ = await _first_matching_selector(
-                    page, STOP_BUTTON_SELECTORS[model], timeout_ms=500, state="visible"
+                    page, STOP_BUTTON_SELECTORS[model],
+                    timeout_ms=500, state="visible"
                 )
                 if stop_sel is None:
-                    return current_text  # Stable and stop button gone
-                # Stop button still visible — keep waiting
-                stable_since = None
+                    return current_text   # ✓ stable + stop button gone
+                stable_since = None       # still generating — keep waiting
         else:
-            # Text changed — reset stability timer
-            last_text = current_text
+            last_text    = current_text
             stable_since = None
 
-    print(f"[warn] Timed out after {MAX_WAIT_SECONDS}s waiting for {model} response")
+    print(f"Timed out after {MAX_WAIT_SECONDS}s waiting for {model} response")
     return last_text
 
-async def _find_page(browser, model: str) -> Page | None:
+
+async def _find_page(browser, model: str) -> Optional[Page]:
     """Locate the already-open browser tab for a given provider."""
     matchers = {
         "chatgpt": lambda u: "chat.openai.com" in u or "chatgpt.com" in u,
-        "gemini": lambda u: "gemini.google.com" in u,
-        "claude": lambda u: "claude.ai" in u,
+        "gemini":  lambda u: "gemini.google.com" in u,
+        "claude":  lambda u: "claude.ai" in u,
     }
     match = matchers.get(model)
     if not match:
@@ -306,39 +565,91 @@ async def _find_page(browser, model: str) -> Page | None:
                 return candidate
     return None
 
-async def rcv_web_int(model: str, prompt: str) -> str:
+
+async def rcv_web_int(
+    model: str,
+    payload: ClipboardPayload,
+) -> str:
     """
-    Send *prompt* to an already-open AI web UI tab and return the response text.
+    Send a text prompt or image to an already-open AI web UI tab and
+    return the response text.
+
     Supported models: "chatgpt", "gemini", "claude"
     """
     model = model.lower()
     if model not in EDITOR_SELECTORS:
-        raise ValueError(f"Unsupported model '{model}'. Choose from: {list(EDITOR_SELECTORS)}")
+        raise ValueError(
+            f"Unsupported model '{model}'. Choose from: {list(EDITOR_SELECTORS)}"
+        )
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(DEBUG_PORT)
+        try:
+            browser = await p.chromium.connect_over_cdp(DEBUG_PORT)
+        except Exception:
+            # Launch Xvfb first, then Chromium against it
+            subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1920x1080x24"])
+            # Playwright doesn't require high res - keeping for future use as high res memory consumption is negligible
+            await asyncio.sleep(2)
+
+            subprocess.Popen(
+                [
+                    "chromium",
+                    "--remote-debugging-port=9222",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--enable-blink-features=DragInterception",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+                env={**os.environ, "DISPLAY": ":99"},
+            )
+
+            # Retry CDP connection — Chromium takes a second or two to be ready
+            for attempt in range(10):
+                await asyncio.sleep(1)
+                try:
+                    browser = await p.chromium.connect_over_cdp(DEBUG_PORT)
+                    break
+                except Exception:
+                    if attempt == 9:
+                        raise RuntimeError(
+                            "Could not connect to Chromium after 10 attempts. "
+                            "Make sure 'chromium' is on your PATH."
+                        )
 
         page = await _find_page(browser, model)
         if not page:
-            raise RuntimeError(
-                f"No open tab found for '{model}'. Make sure the browser is running with --remote-debugging-port=9222 and the AI tab is open."
-            )
+            urls = {
+                "chatgpt": "https://chatgpt.com",
+                "gemini":  "https://gemini.google.com",
+                "claude":  "https://claude.ai",
+            }
+            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = await ctx.new_page()
+            await page.goto(urls[model], wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
 
-        last_exc: Exception | None = None
+        last_exc: Optional[Exception] = None
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                # Find the editor
-                selector, _ = await _find_editor(page, model)
+                if payload.kind == ClipboardKind.TEXT:
+                    selector, _ = await _find_editor(page, model)
+                    await _inject_text(page, selector, payload.text)
+                    await page.wait_for_timeout(300)
+                    await _submit(page, model)
 
-                # Inject the prompt
-                await _inject_prompt(page, selector, prompt)
-                await page.wait_for_timeout(300)
+                elif payload.kind == ClipboardKind.IMAGE:
+                    await _inject_image(
+                        page, model, payload.image_bytes, payload.mime_type
+                    )
+                    # After the image is attached, submit (Enter or send btn)
+                    await page.wait_for_timeout(300)
+                    await _submit(page, model)
 
-                # Submit
-                await _submit(page, model)
+                else:
+                    raise ValueError("Clipboard payload is empty - nothing to send")
 
-                # Wait for a stable response
                 response = await _wait_for_response_stable(page, model)
 
                 if response.strip():
@@ -350,7 +661,7 @@ async def rcv_web_int(model: str, prompt: str) -> str:
                 last_exc = exc
                 print(f"[attempt {attempt}/{MAX_RETRIES}] Error: {exc}")
                 if attempt < MAX_RETRIES:
-                    backoff = 2 ** attempt  # 2 s, 4 s, …
+                    backoff = 2 ** attempt   # 2 s, 4 s, …
                     print(f"  Retrying in {backoff}s…")
                     await asyncio.sleep(backoff)
 
@@ -358,13 +669,19 @@ async def rcv_web_int(model: str, prompt: str) -> str:
             f"All {MAX_RETRIES} attempts failed for '{model}'"
         ) from last_exc
 
+
 async def main() -> None:
-    prompt = pyperclip.paste() # TODO: Add image support
-    if not prompt.strip():
-        print("[error] Clipboard is empty — nothing to send.")
+    MODEL = "gemini"
+    payload = read_clipboard()
+
+    if payload.kind == ClipboardKind.EMPTY:
+        print("Clipboard is empty.")
         return
 
-    response = await rcv_web_int("chatgpt", prompt)
+    kind_label = "image" if payload.kind == ClipboardKind.IMAGE else "text"
+    print(f"Clipboard contains {kind_label} - sending to {MODEL}")
+
+    response = await rcv_web_int(MODEL, payload)
     pyperclip.copy(response)
     subprocess.run("type_text", shell=True)
 

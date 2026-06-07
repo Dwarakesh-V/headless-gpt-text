@@ -1,1 +1,2 @@
 .venv/
+xvfb-chromium-flags.sh
