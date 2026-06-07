@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
+import json
+from pathlib import Path
 
 import pyperclip
 from playwright.async_api import async_playwright, Page
@@ -670,7 +672,10 @@ async def rcv_web_int(
 
 
 async def main() -> None:
-    MODEL = "chatgpt"
+
+    with open(Path("~/env-settings.json").expanduser()) as f:
+        data = json.load(f)
+    MODEL = data["model"]
     payload = read_clipboard()
 
     if payload.kind == ClipboardKind.EMPTY:
