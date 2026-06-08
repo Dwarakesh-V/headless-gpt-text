@@ -687,7 +687,7 @@ async def main() -> None:
 
     response = await rcv_web_int(MODEL, payload)
     pyperclip.copy(response)
-    subprocess.run("type_text", shell=True)
+    subprocess.run("type-text", shell=True)
 
 
 if __name__ == "__main__":
